@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Options Chain Converter</title>
+<style>
+  body{font-family:Consolas,Menlo,monospace;font-size:14px;margin:0;padding:24px;background:#fff;color:#000}
+  *{box-sizing:border-box}
+  .top{border-bottom:1px dotted #000;padding:0 0 16px 0;margin-bottom:16px}
+  .btn{border:1px solid #000;background:#fff;padding:8px 22px;cursor:pointer;font:inherit;border-radius:0;-webkit-appearance:none}
+  .btn:hover{background:#eee}
+  #fname{margin-left:12px;color:#555;word-break:break-all}
+  .item{display:flex;align-items:center;gap:14px;margin-bottom:8px}
+  .item .lab{width:190px;flex:none}
+  .box{border:1px solid #000;padding:6px 8px;flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;background:#fff;cursor:pointer;min-height:34px}
+  .box.open{white-space:normal;word-break:break-all;text-overflow:clip}
+  .cp{width:78px;flex:none}
+  .hint{color:#777;font-size:12px;margin:0 0 10px}
+  .params{margin-top:14px;padding-left:0;font-size:13px}
+  .prow{display:flex;align-items:center;gap:10px;height:30px}
+  .prow b{width:80px;font-weight:normal;flex:none}
+  .params select{font:inherit;padding:2px}
+  .params input{width:100px;font:inherit;border-radius:0;border:1px solid #000;padding:2px 4px}
+  @media (max-width:640px){
+    body{padding:14px;font-size:15px}
+    .item{flex-wrap:wrap;gap:6px;margin-bottom:14px}
+    .item .lab{width:100%;font-weight:bold}
+    .box{flex:1 1 0}
+    .prow{flex-wrap:wrap;height:auto;margin-bottom:8px}
+    .params select,.params input{font-size:16px} /* tránh iOS tự zoom */
+    .params select{max-width:100%}
+  }
+  #status{margin-top:16px;color:#080;min-height:1em}
+  .err{color:#c00 !important}
+</style>
+</head>
+<body>
+<div class="top">
+  <input type="file" id="file" accept=".csv,text/csv,text/comma-separated-values,application/csv,text/plain,application/vnd.ms-excel" hidden>
+  <button class="btn" id="up">Upload File</button><span id="fname"></span>
+  <div class="params">
+    <div class="prow"><b>S (spot)</b>
+      <select id="mS"><option value="auto">Tự suy ra từ file</option><option value="manual">Tự nhập</option></select>
+      <input id="pS" type="number" step="any" readonly></div>
+    <div class="prow"><b>T (ngày)</b>
+      <select id="mT"><option value="auto">Tự suy ra từ file</option><option value="manual">Tự nhập</option></select>
+      <input id="pT" type="number" step="any" readonly></div>
+    <div class="prow"><b>IV (%)</b>
+      <select id="mI"><option value="auto">Lấy từ file (từng strike)</option><option value="manual">Tự nhập (một IV cho tất cả)</option></select>
+      <input id="pI" type="number" step="any" readonly></div>
+    <div class="prow"><b>r (%)</b> <input id="pR" type="number" step="any" value="4"></div>
+    <div class="prow"><b>q (%)</b> <input id="pQ" type="number" step="any" value="0"></div>
+    <div style="color:#777;margin-top:4px">Các thông số này chỉ dùng để tính Theta / Theta Exposure, áp dụng cho toàn bộ dòng trong file.</div>
+  </div>
+</div>
+
+<p class="hint">Chạm vào ô chuỗi để mở rộng xem đầy đủ; bấm Copy để sao chép.</p>
+<div id="list"></div>
+<div id="status"></div>
+
+<script>
+// Cấu hình từng dòng: label, prefix, cột, kiểu (split C/P hoặc sum+rank), số chữ số thập phân
+const ROWS = [
+  {label:'Open Interest:', type:'oi'},
+  {label:'Implied Volatility:', type:'iv', col:'iv_pct', dec:2},
+  {label:'Delta:',   type:'cp', prefix:'Δ',  col:'delta', dec:4},
+  {label:'Gamma:',   type:'cp', prefix:'Γ',  col:'gamma', dec:5},
+  {label:'Vega:',    type:'cp', prefix:'VG', col:'vega',  dec:4},
+  {label:'Vanna:',   type:'cp', prefix:'VN', col:'vanna', dec:4},
+  {label:'Charm:',   type:'cp', prefix:'CH', col:'charm', dec:3},
+  {label:'Theta:',   type:'cp', prefix:'TH', col:'theta', dec:3},
+  {label:'GEX:',     type:'rank', prefix:'GEX',  col:'gex',     dec:0},
+  {label:'DEX:',     type:'rank', prefix:'DEX',  col:'dex',     dec:0},
+  {label:'VEX:',     type:'rank', prefix:'VEX',  col:'vex',     dec:0},
+  {label:'Vega Exposure:',  type:'rank', prefix:'VGEX', col:'vegaex',  dec:0},
+  {label:'Charm Exposure:', type:'rank', prefix:'CHEX', col:'charmex', dec:0},
+  {label:'Theta Exposure:', type:'rank', prefix:'THEX', col:'thetaex', dec:0},
+];
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+$('list').innerHTML = ROWS.map((r,i)=>
+  `<div class="item"><span class="lab">${r.label}</span><div class="box" id="box${i}"></div><button class="btn cp" data-i="${i}">Copy</button></div>`
+).join('');
+document.querySelectorAll('.box').forEach(b=>b.addEventListener('click',()=>b.classList.toggle('open')));
+
+const outputs = ROWS.map(()=> '');
+
+// Parse CSV đơn giản (không có dấu ngoặc kép trong file này, nhưng vẫn xử lý cơ bản)
+function parseCSV(text){
+  const lines = text.replace(/\r/g,'').split('\n').filter(l=>l.trim());
+  const head = lines[0].split(',').map(s=>s.trim());
+  return lines.slice(1).map(l=>{
+    const v = l.split(','); const o = {};
+    head.forEach((h,i)=>o[h]=v[i]===undefined?'':v[i].trim());
+    return o;
+  });
+}
+
+// Làm tròn và bỏ số 0 thừa
+function fmt(x, dec){
+  const n = Number(x);
+  if(!isFinite(n)) return '0';
+  const s = n.toFixed(dec);
+  return dec>0 ? String(parseFloat(s)) : s.replace(/^-0$/,'0');
+}
+
+// Viết tắt số lớn: >=1B -> B, >=1M -> M, >=1K -> K (tối đa 1 số lẻ), nhỏ hơn thì làm tròn số nguyên
+function abbr(x){
+  const n = Number(x); if(!isFinite(n)) return '0';
+  const a = Math.abs(n), sg = n<0?'-':'';
+  const t = v => String(parseFloat(v.toFixed(1)));
+  if(a>=999.95e6) return sg + t(a/1e9) + 'B';
+  if(a>=999.95e3) return sg + t(a/1e6) + 'M';
+  if(a>=1e3) return sg + t(a/1e3) + 'K';
+  return sg + String(Math.round(a));
+}
+
+// ===== Theta (Black-Scholes, $/cổ phiếu/ngày) =====
+const pdf = x => Math.exp(-x*x/2)/Math.sqrt(2*Math.PI);
+function cdf(x){ // xấp xỉ Abramowitz-Stegun
+  const t=1/(1+0.2316419*Math.abs(x)), d=pdf(x);
+  const p=d*t*(0.319381530+t*(-0.356563782+t*(1.781477937+t*(-1.821255978+t*1.330274429))));
+  return x>0?1-p:p;
+}
+const median = a => { const b=a.filter(isFinite).sort((x,y)=>x-y); return b.length? b[Math.floor(b.length/2)] : NaN; };
+
+// Suy S và T (năm) từ file: dex = delta*oi*100*S ; vega/gamma = S^2*sigma*T
+function inferParams(rows){
+  const S = median(rows.filter(r=>+r.oi>0&&+r.delta!==0).map(r=>Math.abs(r.dex)/(Math.abs(r.delta)*r.oi*100)));
+  const T = median(rows.filter(r=>+r.gamma>0&&+r.iv_pct>0).map(r=>r.vega/(r.gamma*S*S*(r.iv_pct/100))));
+  return {S, Tdays:T*365};
+}
+function theta(r,S,T,rf,q,ivPct){
+  const sg=ivPct/100, K=+r.strike;
+  if(!(T>0&&sg>0)) return 0;
+  const sq=Math.sqrt(T), d1=(Math.log(S/K)+(rf-q+sg*sg/2)*T)/(sg*sq), d2=d1-sg*sq;
+  const a=-S*Math.exp(-q*T)*pdf(d1)*sg/(2*sq);
+  const th = r.right==='C'
+    ? a - rf*K*Math.exp(-rf*T)*cdf(d2) + q*S*Math.exp(-q*T)*cdf(d1)
+    : a + rf*K*Math.exp(-rf*T)*cdf(-d2) - q*S*Math.exp(-q*T)*cdf(-d1);
+  return th/365; // theo ngày
+}
+function addTheta(rows){
+  const P=getParams();
+  rows.forEach(r=>{
+    const iv = P.ivAuto ? r.iv_pct : P.iv;
+    r.theta = theta(r,P.S,P.T,P.rf,P.q,iv);
+    r.thetaex = r.theta*(parseFloat(r.oi)||0)*100;
+  });
+}
+// Đọc thông số: chế độ auto -> dùng giá trị suy ra từ file; manual -> giá trị người dùng nhập
+let inferred = {S:NaN, Tdays:NaN};
+function getParams(){
+  const S = $('mS').value==='auto' ? inferred.S : +$('pS').value;
+  const Td = $('mT').value==='auto' ? inferred.Tdays : +$('pT').value;
+  return {S, T:Td/365, ivAuto:$('mI').value==='auto', iv:+$('pI').value, rf:(+$('pR').value)/100, q:(+$('pQ').value)/100};
+}
+function syncInputs(){
+  const set=(m,inp,val)=>{
+    const auto=$(m).value==='auto';
+    $(inp).readOnly=auto;
+    if(auto && isFinite(val)) $(inp).value = (+val).toFixed(4).replace(/\.?0+$/,'');
+  };
+  set('mS','pS',inferred.S); set('mT','pT',inferred.Tdays);
+  // IV auto: ô hiển thị IV trung vị của file để tham khảo
+  const auto=$('mI').value==='auto'; $('pI').readOnly=auto;
+  if(auto && isFinite(inferred.ivMed)) $('pI').value=inferred.ivMed.toFixed(2);
+}
+
+function build(rows){
+  const N = k => rows.map(r=>({...r, strike:r.strike, right:r.right.toUpperCase()}));
+  const data = N();
+  // sắp xếp theo strike tăng dần, C trước P
+  data.sort((a,b)=> parseFloat(a.strike)-parseFloat(b.strike) || (a.right<b.right?-1:1));
+
+  const res = [];
+  ROWS.forEach((cfg,i)=>{
+    let items = [];
+    if(cfg.type==='oi'){
+      // CALL=strike:oi,... PUT=strike:oi,...
+      const c = data.filter(r=>r.right==='C').map(r=>`CALL=${r.strike}:${fmt(r.oi,0)}`);
+      const p = data.filter(r=>r.right==='P').map(r=>`PUT=${r.strike}:${fmt(r.oi,0)}`);
+      items = c.concat(p);
+    } else if(cfg.type==='iv'){
+      // STRIKE=iv%:C / :P
+      items = data.map(r=>`${r.strike}=${fmt(r[cfg.col],cfg.dec)}%:${r.right}`);
+    } else if(cfg.type==='cp'){
+      items = data.map(r=>`${cfg.prefix}=${r.strike}:${fmt(r[cfg.col],cfg.dec)}:${r.right}`);
+    } else {
+      // Gộp Call + Put theo strike, xếp hạng theo giá trị tuyệt đối lớn -> nhỏ
+      const m = new Map();
+      data.forEach(r=>m.set(r.strike,(m.get(r.strike)||0)+(parseFloat(r[cfg.col])||0)));
+      const arr = [...m.entries()].sort((a,b)=>Math.abs(b[1])-Math.abs(a[1]));
+      items = arr.map(([s,v],idx)=>`${cfg.prefix}${idx+1}=${s}:${abbr(v)}`);
+    }
+    res.push(items.join(','));
+  });
+  return res;
+}
+
+let loaded = null;
+function render(){
+  if(!loaded) return;
+  const rows = loaded.map(r=>({...r}));
+  addTheta(rows);
+  const out = build(rows);
+  out.forEach((s,i)=>{ outputs[i]=s; $('box'+i).textContent=s; $('box'+i).title=s; });
+  statusEl.className=''; statusEl.textContent = `Đã xử lý ${rows.length} dòng.`;
+}
+['pS','pT','pI','pR','pQ'].forEach(id=>$(id).addEventListener('input',render));
+['mS','mT','mI'].forEach(id=>$(id).addEventListener('change',()=>{syncInputs();render();}));
+
+function handleFile(file){
+  $('fname').textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = e=>{
+    try{
+      const rows = parseCSV(e.target.result);
+      const need = ['strike','right','oi','iv_pct','delta','gamma','vega','vanna','charm','gex','dex','vex','vegaex','charmex'];
+      const miss = need.filter(k=>!(k in rows[0]));
+      if(miss.length) throw new Error('Thiếu cột: '+miss.join(', '));
+      const num = ['dex','delta','oi','vega','gamma','iv_pct'];
+      rows.forEach(r=>num.forEach(k=>r[k]=parseFloat(r[k])));
+      const inf = inferParams(rows);
+      inferred = {S:inf.S, Tdays:inf.Tdays, ivMed:median(rows.map(r=>r.iv_pct))};
+      syncInputs(); loaded = rows; render();
+    }catch(err){
+      statusEl.className='err'; statusEl.textContent = 'Lỗi: '+err.message;
+    }
+  };
+  reader.readAsText(file);
+}
+
+$('up').onclick = ()=>$('file').click();
+$('file').onchange = e=>{ if(e.target.files[0]) handleFile(e.target.files[0]); };
+
+document.querySelectorAll('.cp').forEach(b=>{
+  b.onclick = async ()=>{
+    const s = outputs[+b.dataset.i]; if(!s) return;
+    try{ await navigator.clipboard.writeText(s); }
+    catch{ const t=document.createElement('textarea'); t.value=s; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); }
+    const old=b.textContent; b.textContent='Copied!'; setTimeout(()=>b.textContent=old,900);
+  };
+});
+</script>
+</body>
+</html>
